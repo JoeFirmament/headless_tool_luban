@@ -1,0 +1,27 @@
+# 编译生成的文件
+luban_toolkit_tui
+
+# 依赖库
+FTXUI/
+
+# 日志文件
+*.log
+
+# 临时文件
+*.o
+*.out
+*.exe
+*.tmp
+
+# 编译脚本
+compile.sh
+*.sh
+
+# 测试文件
+test.*
+
+# IDE和编辑器文件
+.vscode/
+.idea/
+*.swp
+*.swo 
