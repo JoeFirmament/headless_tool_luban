@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "context7": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@upstash/context7-mcp@latest"
+      ]
+    },
+    "server-sequential-thinking": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@smithery/cli@latest",
+        "run",
+        "@smithery-ai/server-sequential-thinking",
+        "--key",
+        "0fae59e5-b920-470d-bd1c-4a788bbe647b"
+      ]
+    },
+    "sequential-thinking": {
+      "command": "npx", 
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-sequential-thinking"
+      ]
+    }
+  }
+}
+摄像头标签页中，新建一个“显示图片”按钮。 这个按钮和“获取图片”按钮在一行。 点击显示按钮，就把最近一次存下来的图片通过stb_image显示到 terminal。 我的程序需要用在 远程 ssh 的纯 shell 无头环境，所以选择stb_image。 
