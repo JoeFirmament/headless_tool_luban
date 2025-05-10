@@ -1,6 +1,6 @@
-# Luban TUI Toolkit
+# Board_Check_Toolkit
 
-基于 FTXUI 库开发的终端用户界面工具包，用于串口通信、摄像头控制和系统信息显示。
+基于 FTXUI 库开发的终端用户界面工具包，用于检查开发板的串口通信、摄像头控制和系统信息显示。
 
 ## 开发环境信息
 
@@ -25,24 +25,42 @@ sudo apt-get install -y \
     v4l-utils \
     libudev-dev \
     libusb-1.0-0-dev \
-    timg
+    timg \
+    net-tools \
+    iw
 ```
+
+### 命令行工具说明
+
+本程序使用了以下命令行工具：
+
+1. **v4l2-ctl** (来自 v4l-utils 包)
+   - 用途：用于控制视频设备、列出设备信息、设置视频格式和捕获图像
+   - 主要功能：
+     - 列出可用视频设备：`v4l2-ctl --list-devices`
+     - 查询设备支持的格式：`v4l2-ctl --device /dev/videoX --list-formats-ext`
+     - 捕获图像：`v4l2-ctl --device /dev/videoX --set-fmt-video=width=W,height=H --stream-mmap --stream-count=1 --stream-to=output.jpg`
+
+2. **timg**
+   - 用途：在终端中显示图像
+   - 安装：`sudo apt-get install timg`
+   - 使用方法：`timg image.jpg`
+
+3. **系统信息工具**
+   - `hostname`：获取主机名
+   - `uptime`：获取系统运行时间
+   - `free`：显示内存使用情况
+   - `lscpu`：显示CPU信息
+   - `ip`：显示网络接口信息
+   - `iwgetid`：获取当前WiFi SSID
 
 ### 串口访问权限设置
 
-```bash
-# 将当前用户添加到 dialout 组以访问串口设备
-sudo usermod -a -G dialout $USER
-# 重新登录以使更改生效
-```
+
 
 ### 摄像头访问权限设置
 
-```bash
-# 将当前用户添加到 video 组以访问摄像头设备
-sudo usermod -a -G video $USER
-# 重新登录以使更改生效
-```
+
 
 ## 编译安装
 
@@ -88,10 +106,10 @@ sudo ./luban_toolkit_tui
   - 自动检测可用串口设备
   - 支持连接/断开操作
   - 实时数据显示
-  - 波特率可配置
+  - 波特率已配置为115200
 
 - 摄像头控制
-  - USB 摄像头自动检测
+  - USB 摄像头自动检测出USB 摄像头
   - 支持查看设备信息
   - 支持拍照功能
   - 图片预览（使用 timg）
@@ -99,22 +117,32 @@ sudo ./luban_toolkit_tui
 - 系统信息显示
   - CPU 使用率
   - 内存使用情况
-  - 磁盘使用情况
+  - 磁盘使用情况等
 
 ## 故障排除
 
 1. 串口访问权限问题：
-   - 确保用户在 dialout 组中
-   - 检查串口设备权限：`ls -l /dev/ttyUSB*`
+   - 确保用户以root身份运行程序
+
 
 2. 摄像头访问问题：
-   - 确保用户在 video 组中
    - 检查摄像头设备：`ls -l /dev/video*`
    - 使用 `v4l2-ctl --list-devices` 查看可用设备
+   - 检查 v4l2-ctl 是否正确安装：`which v4l2-ctl`
+   - 测试摄像头功能：`v4l2-ctl --device /dev/videoX --set-fmt-video=width=640,height=480 --stream-mmap --stream-count=1 --stream-to=test.jpg`
 
-3. 编译错误：
+3. 图像显示问题：
+   - 确保 timg 已正确安装：`which timg`
+   - 如果 timg 无法显示图像，可以尝试使用其他工具：`display test.jpg` (需要安装 ImageMagick)
+   - 检查图像文件是否有效：`file test.jpg`
+
+4. 系统信息获取问题：
+   - 检查网络工具是否安装：`which ip iwgetid`
+   - 如果某些系统信息无法获取，可能需要安装额外的工具：`sudo apt-get install net-tools iw`
+
+5. 编译错误：
    - 确保已安装所有必需的开发包
-   - 检查 CMake 版本是否满足要求
+   - 检查 CMake 版本是否满足要求：`cmake --version`
    - 查看编译日志获取详细错误信息
 
 ## 日志文件
@@ -122,10 +150,17 @@ sudo ./luban_toolkit_tui
 - `debug.log`: 程序运行时的调试信息
 - `development.log`: 开发过程中的更新记录
 
-## 许可证
+## 命令执行机制
 
-[待添加许可证信息]
+本程序使用了安全的命令执行机制，具有以下特点：
 
-## 贡献指南
+1. **超时控制**：所有外部命令执行都有超时限制，防止程序因命令执行卡住
+2. **非阻塞读取**：使用非阻塞 I/O 和 poll 机制读取命令输出
+3. **错误处理**：捕获并记录命令执行过程中的错误
+4. **权限检查**：在执行需要特权的命令前检查 root 权限
 
-[待添加贡献指南] 
+主要命令执行函数 `exec_command` 支持以下参数：
+- 命令字符串
+- 超时时间（毫秒）
+- 是否忽略非零退出码
+
