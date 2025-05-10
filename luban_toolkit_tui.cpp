@@ -28,6 +28,7 @@
 #include <iomanip> // For std::put_time
 #include <algorithm> // For std::min
 #include <cctype> // For std::isspace
+#include <map> // For std::map
 
 using namespace ftxui;
 
@@ -246,7 +247,8 @@ std::string exec_command(const std::string& cmd, int timeout_ms = 5000, bool ign
 
 struct VideoDeviceInfo {
     std::string path;
-    std::vector<std::string> resolutions;
+    // Use a map to store resolutions per format
+    std::map<std::string, std::vector<std::string>> resolutions_by_format;
 };
 
 // 查找 USB 视频设备
@@ -321,7 +323,7 @@ std::vector<VideoDeviceInfo> find_video_devices() {
 
     // For each found USB video device, query its resolutions
     for (const auto& device_path : usb_video_paths) {
-        write_debug_log("查询 USB 设备分辨率: " + device_path);
+        write_debug_log("查询 USB 设备分辨率和格式: " + device_path);
         // Do NOT ignore nonzero exit code for list-formats-ext command
         std::string check_cmd = "timeout 2 v4l2-ctl --device " + device_path + " --list-formats-ext 2>/dev/null";
         std::string check_result = exec_command(check_cmd, 3000, false); // Do NOT ignore nonzero exit code
@@ -363,28 +365,44 @@ std::vector<VideoDeviceInfo> find_video_devices() {
 
             std::istringstream format_stream(check_result);
             std::string format_line;
-            // Modified regex to match resolutions after Discrete or Stepwise
-            std::regex res_regex("Size: (Discrete|Stepwise) (\\d+x\\d+)");
+            std::string current_format = "未知格式"; // Default format
+            std::regex format_name_regex("\\[\\d+\\]: '(.*?)'"); // Regex to capture format name like 'MJPG' or 'YUYV'
+            std::smatch format_name_match;
+
+            std::regex res_regex("Size: (Discrete|Stepwise) (\\d+x\\d+)"); // Regex to match resolutions
             std::smatch res_match;
 
+
             while (std::getline(format_stream, format_line)) {
-                // Add debug log for each line being checked for resolution
-                // write_debug_log("Checking line for resolution: " + format_line);
-                if (std::regex_search(format_line, res_match, res_regex) && res_match.size() > 2) {
-                    info.resolutions.push_back(res_match[2].str());
-                    write_debug_log("找到分辨率: " + res_match[2].str() + " (匹配行: " + format_line + ")");
+                // Check if this line contains a format name
+                if (std::regex_search(format_line, format_name_match, format_name_regex) && format_name_match.size() > 1) {
+                    current_format = format_name_match[1].str();
+                    write_debug_log("切换到格式: " + current_format);
+                }
+                // Check if this line contains a resolution
+                else if (std::regex_search(format_line, res_match, res_regex) && res_match.size() > 2) {
+                    info.resolutions_by_format[current_format].push_back(res_match[2].str());
+                    write_debug_log("为格式 " + current_format + " 找到分辨率: " + res_match[2].str());
                 }
             }
 
-            write_debug_log("设备 " + device_path + " 找到分辨率数量: " + std::to_string(info.resolutions.size()));
-
-            if (!info.resolutions.empty()) {
-                devices.push_back(info);
-                write_debug_log("添加设备 " + device_path + " 到列表，支持 " +
-                              std::to_string(info.resolutions.size()) + " 种分辨率");
-            } else {
-                write_debug_log("设备 " + device_path + " 未找到有效分辨率，跳过 (未提取到分辨率)");
+            // Check if any resolutions were successfully added to the map
+            bool resolutions_extracted = false;
+            for(const auto& pair : info.resolutions_by_format) {
+                if (!pair.second.empty()) {
+                    resolutions_extracted = true;
+                    break;
+                }
             }
+
+            write_debug_log("设备 " + device_path + " 找到的格式数量: " + std::to_string(info.resolutions_by_format.size()));
+            if (resolutions_extracted) {
+                 devices.push_back(info);
+                 write_debug_log("添加设备 " + device_path + " 到列表，找到分辨率");
+            } else {
+                 write_debug_log("设备 " + device_path + " 未提取到任何分辨率，跳过");
+            }
+
         } else {
             write_debug_log("设备 " + device_path + " 不支持视频格式或查询失败 (check_result 错误或未找到分辨率行)");
         }
@@ -683,49 +701,64 @@ int main() {
             auto current_video_list = Container::Vertical({});
              for (size_t i = 0; i < video_devices.size(); ++i) {
                 std::string name = video_devices[i].path.substr(video_devices[i].path.rfind('/') + 1);
-                auto resolutions = video_devices[i].resolutions;
+                auto resolutions_by_format = video_devices[i].resolutions_by_format;
 
-                // 这个内部的 Container::Vertical 包含 Components (Button 和 Renderer Component)
+                // This inner Container::Vertical contains Components (Button and Renderer Component)
                 current_video_list->Add(Container::Vertical(Components{
                     Button(name, [&, i] {
-                        std::lock_guard<std::mutex> state_lock(state_mutex); // 锁定状态变量
+                        std::lock_guard<std::mutex> state_lock(state_mutex); // Lock state variables
                         selected_video = static_cast<int>(i);
                         std::lock_guard<std::mutex> log_lock(logs_mutex);
                         logs.push_back("选中视频设备: " + video_devices[selected_video].path);
                         write_debug_log("选中视频设备: " + video_devices[selected_video].path);
                     }),
-                    Renderer([resolutions] {
-                        Elements res_elements;
-                        for (const auto& res : resolutions) {
-                            res_elements.push_back(text("  " + res) | dim);
+                    Renderer([resolutions_by_format] { // Capture map by value
+                        Elements format_elements;
+                        for (const auto& pair : resolutions_by_format) {
+                            std::string format_name = pair.first;
+                            const auto& resolutions = pair.second;
+
+                            Elements res_elements_horizontal;
+                            res_elements_horizontal.push_back(text("  " + format_name + ": ") | dim); // Format name
+
+                            std::stringstream res_line;
+                            for(size_t j = 0; j < resolutions.size(); ++j) {
+                                res_line << resolutions[j];
+                                if (j < resolutions.size() - 1) {
+                                    res_line << " "; // Separate resolutions with a space
+                                }
+                            }
+                            res_elements_horizontal.push_back(text(res_line.str()));
+
+                            format_elements.push_back(hbox(res_elements_horizontal));
                         }
-                        return vbox(res_elements);
+                        return vbox(format_elements); // vbox returns an Element
                     })
                 }));
             }
-            // 有设备时，返回包含渲染后的列表容器和渲染后的按钮的 vbox (Elements)
+            // When devices are found, return a vbox (Elements) containing the rendered list container and the rendered button
             return vbox(Elements{
-                current_video_list->Render() | flex,
-                 Button("刷新设备列表", [&] { // 捕获 logs_mutex, video_devices, serial_devices, serial_list_container, selected_video, selected_serial, screen, state_mutex
+                current_video_list->Render() | flex, // Render container to get Element
+                 Button("刷新设备列表", [&] { // Capture logs_mutex, video_devices, serial_devices, serial_list_container, selected_video, selected_serial, screen, state_mutex
                     write_debug_log("点击刷新设备列表按钮 (有设备时)");
-                    // 在新线程中执行刷新操作
-                    std::thread refresh_thread([&] { // 捕获 logs_mutex, video_devices, serial_devices, screen, state_mutex
+                    // Execute refresh operation in a new thread
+                    std::thread refresh_thread([&] { // Capture logs_mutex, video_devices, serial_devices, screen, state_mutex
                          write_debug_log("刷新设备列表线程开始 (有设备时)");
-                        auto new_video_devices = find_video_devices(); // 现在只查找 USB 视频设备
+                        auto new_video_devices = find_video_devices(); // Now only finds USB video devices
                         auto new_serial_devices = find_serial_devices();
 
-                        // 锁定状态变量进行更新
-                        std::lock_guard<std::mutex> lock(state_mutex); // 确保在更新共享状态前锁定
+                        // Lock state variables for update
+                        std::lock_guard<std::mutex> lock(state_mutex); // Ensure locking before updating shared state
                         video_devices = new_video_devices;
                         serial_devices = new_serial_devices;
 
-                        // 重新填充 serial_list_container (通过事件通知主线程)
+                        // Repopulate serial_list_container (notify main thread via event)
                         write_debug_log("设备列表刷新完成，发送 UI 更新事件 (有设备时)");
-                        screen.PostEvent(ftxui::Event::Custom); // 发送自定义事件通知 UI 更新
+                        screen.PostEvent(ftxui::Event::Custom); // Send custom event to notify UI update
                     });
-                    refresh_thread.detach(); // 分离线程，让其独立运行
+                    refresh_thread.detach(); // Detach thread to run independently
 
-                    // 锁定日志进行写入
+                    // Lock logs for writing
                     std::lock_guard<std::mutex> log_lock_button(logs_mutex);
                     logs.push_back("已触发设备列表刷新。");
 
