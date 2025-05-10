@@ -14,8 +14,8 @@ FTXUI/
 *.tmp
 
 # 编译脚本
-compile.sh
-*.sh
+#compile.sh
+#*.sh
 
 # 测试文件
 test.*
