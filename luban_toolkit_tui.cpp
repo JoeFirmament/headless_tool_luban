@@ -29,6 +29,7 @@
 #include <algorithm> // For std::min
 #include <cctype> // For std::isspace
 #include <map> // For std::map
+#include <numeric> // For std::accumulate
 
 using namespace ftxui;
 
@@ -193,7 +194,7 @@ std::string exec_command(const std::string& cmd, int timeout_ms = 5000, bool ign
         } else if (poll_ret == 0) {
             // Timeout occurred
             timed_out = true;
-            write_debug_log("poll() 超时");
+            write_debug_log("命令执行超时");
             break; // Exit the main loop on timeout
         } else if (errno != EINTR) {
             // poll returned an error other than EINTR
@@ -354,12 +355,13 @@ std::vector<VideoDeviceInfo> find_video_devices() {
 
 
         // Check if the command executed successfully and at least one resolution was found
+        // The device is considered supported if the command output is not an error AND at least one resolution regex match is found
         bool command_successful_and_resolution_found = (check_result.substr(0, 5) != "错误:" && resolution_found_by_regex);
         write_debug_log("检查结果: command_successful_and_resolution_found = " + std::string(command_successful_and_resolution_found ? "true" : "false"));
 
 
         if (command_successful_and_resolution_found) {
-            write_debug_log("设备 " + device_path + " 支持视频格式 (找到分辨率)");
+            write_debug_log("设备 " + device_path + " 支持视频格式 (找到分辨率行)"); // Updated log message
             VideoDeviceInfo info;
             info.path = device_path;
 
@@ -400,11 +402,12 @@ std::vector<VideoDeviceInfo> find_video_devices() {
                  devices.push_back(info);
                  write_debug_log("添加设备 " + device_path + " 到列表，找到分辨率");
             } else {
-                 write_debug_log("设备 " + device_path + " 未提取到任何分辨率，跳过");
+                 // If "Format:" was found but no resolutions were extracted, log this specific case
+                 write_debug_log("设备 " + device_path + " 支持格式但未提取到任何分辨率，跳过");
             }
 
         } else {
-            write_debug_log("设备 " + device_path + " 不支持视频格式或查询失败 (check_result 错误或未找到分辨率行)");
+            write_debug_log("设备 " + device_path + " 不支持视频格式或查询失败 (check_result 错误或未找到分辨率行)"); // Updated log message
         }
     }
 
@@ -452,23 +455,125 @@ std::vector<std::string> find_serial_devices() {
 
 // --- 系统信息获取函数 ---
 struct SystemInfo {
+    std::string hostname; // Add hostname member
     std::string uptime;
     std::string memory;
     std::string os_version;
-    std::string cpu_info;
+    std::string cpu_info; // Store CPU model name
     std::string network_info;
+    std::string cpu_temperature_avg; // Store average temperature
+    // Removed cpu_serial as per user request
+    std::vector<std::string> ip_addresses; // Add IP addresses member
+    bool has_root = false; // Add member to store root privilege status
 
     // 刷新系统信息并记录日志和终端调试信息
     void refresh() {
         write_debug_log("刷新系统信息...");
+        has_root = has_root_privileges(); // Check root privileges
+
+        // Get hostname
+        hostname = exec_command("hostname", 1000);
+
         uptime = exec_command("uptime -p");
         memory = exec_command("free -m | grep Mem | awk '{print $3\"MB used / \"$2\"MB total\"}'");
         os_version = exec_command("cat /etc/os-release | grep PRETTY_NAME | cut -d'\"' -f2");
-        cpu_info = exec_command("cat /proc/cpuinfo | grep 'model name' | head -1 | cut -d: -f2");
+        // Modified command to get CPU info (model name) using lscpu
+        cpu_info = exec_command("lscpu | grep 'Model name:' | cut -d':' -f2 | xargs", 1000); // Use xargs to trim whitespace
 
-        auto ip = exec_command("ip route get 1 | awk '{print $7}' | head -1");
-        auto iface = exec_command("ip route get 1 | awk '{print $5}' | head -1");
-        network_info = iface + " - " + ip;
+        // Get network info including SSID for wlan0 and all IP addresses
+        auto ip_a_result = exec_command("ip a", 1000, true); // Ignore nonzero exit for ip a
+        ip_addresses.clear(); // Clear previous IP addresses
+        std::string current_iface;
+        std::istringstream ip_a_iss(ip_a_result);
+        std::string ip_a_line;
+        std::regex ip_v4_regex("\\s*inet (\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})"); // Regex to capture IPv4 address
+        std::smatch ip_v4_match;
+         std::regex iface_state_regex("^\\d+:\\s*([^:]+):.*state (UP|UNKNOWN)"); // Regex to capture interface name and state
+
+        while(std::getline(ip_a_iss, ip_a_line)) {
+             std::smatch iface_state_match;
+             if (std::regex_search(ip_a_line, iface_state_match, iface_state_regex) && iface_state_match.size() > 2) {
+                 current_iface = iface_state_match[1].str();
+                 write_debug_log("处理接口: " + current_iface + " (状态: " + iface_state_match[2].str() + ")");
+             }
+             // Check for IPv4 addresses on active interfaces
+             if (!current_iface.empty() && (ip_a_line.find(" state UP") != std::string::npos || ip_a_line.find(" state UNKNOWN") != std::string::npos)) {
+                 if (std::regex_search(ip_a_line, ip_v4_match, ip_v4_regex) && ip_v4_match.size() > 1) {
+                     ip_addresses.push_back(current_iface + ": " + ip_v4_match[1].str());
+                     write_debug_log("找到 IPv4 地址: " + ip_v4_match[1].str() + " (接口: " + current_iface + ")");
+                 }
+             }
+        }
+
+        std::string ssid;
+        // Try to get SSID for wlan0 specifically
+        auto ssid_cmd = "iwgetid wlan0 -r 2>/dev/null";
+        ssid = exec_command(ssid_cmd, 1000, true); // Ignore nonzero exit if not connected or wlan0 doesn't exist
+        if (ssid.substr(0, 5) == "错误:" || ssid.empty()) {
+            ssid = "获取失败"; // Handle error or no SSID found
+        }
+
+
+        std::stringstream network_info_ss;
+        network_info_ss << "接口: ";
+        if (!ip_addresses.empty()) {
+             for(size_t i = 0; i < ip_addresses.size(); ++i) {
+                 network_info_ss << ip_addresses[i];
+                 if (i < ip_addresses.size() - 1) {
+                     network_info_ss << ", ";
+                 }
+             }
+        } else {
+             network_info_ss << "未找到活跃接口";
+        }
+        if (ssid != "获取失败") {
+             network_info_ss << " (SSID: " << ssid << ")";
+        }
+        network_info = network_info_ss.str();
+
+
+        // Get CPU temperature
+        std::string temp_result = exec_command("cat /sys/class/thermal/thermal_zone*/temp", 1000, true); // Ignore nonzero exit
+        std::vector<double> temperatures_milli;
+        if (temp_result.substr(0, 5) != "错误:") {
+            std::istringstream temp_iss(temp_result);
+            std::string temp_line;
+            while(std::getline(temp_iss, temp_line)) {
+                if (!temp_line.empty()) {
+                    try {
+                        temperatures_milli.push_back(std::stod(temp_line));
+                    } catch (const std::invalid_argument& ia) {
+                        write_debug_log("错误: 转换温度字符串失败: " + temp_line);
+                    } catch (const std::out_of_range& oor) {
+                         write_debug_log("错误: 温度值超出范围: " + temp_line);
+                    }
+                }
+            }
+        } else {
+             write_debug_log("错误: 获取CPU温度失败");
+        }
+
+        // Calculate and store average temperature
+        if (!temperatures_milli.empty()) {
+            double sum = std::accumulate(temperatures_milli.begin(), temperatures_milli.end(), 0.0);
+            double average_celsius = (sum / temperatures_milli.size()) / 1000.0;
+            std::stringstream ss;
+            ss << std::fixed << std::setprecision(1) << average_celsius << "°C";
+            cpu_temperature_avg = ss.str();
+        } else {
+            cpu_temperature_avg = "获取失败";
+        }
+
+
+        // Removed CPU serial number logic as per user request
+        // std::string serial_result = exec_command("cat /proc/cpuinfo | grep 'Serial' | cut -d':' -f2 | xargs", 1000, true); // Ignore nonzero exit
+        // if (serial_result.substr(0, 5) != "错误:") {
+        //     cpu_serial = serial_result;
+        // } else {
+        //      write_debug_log("错误: 获取CPU序列号失败");
+        //      cpu_serial = "获取失败";
+        // }
+
         write_debug_log("系统信息刷新完成。");
     }
 };
@@ -665,31 +770,35 @@ int main() {
              return vbox(Elements{text("正在加载设备信息...") | hcenter | flex});
         }
 
+        if (!sys_info.has_root) { // Check for root privileges
+             return vbox(Elements{text("查找摄像头需要 root 权限。") | hcenter | flex}); // Chinese message
+        }
+
+
         if (video_devices.empty()) {
             // 没有设备时，返回包含文本和渲染后的按钮的 vbox (Elements)
             return vbox(Elements{
                 text("未找到支持的 USB 摄像头设备。") | hcenter | flex, // 修改提示文本
-                // 渲染按钮以获取 Element
-                Button("刷新设备列表", [&] { // 捕获 logs_mutex, video_devices, serial_devices, serial_list_container, selected_video, selected_serial, screen, state_mutex
-                    write_debug_log("点击刷新设备列表按钮");
-                    // 在新线程中执行刷新操作
-                    std::thread refresh_thread([&] { // 捕获 logs_mutex, video_devices, serial_devices, screen, state_mutex
-                        write_debug_log("刷新设备列表线程开始");
-                        auto new_video_devices = find_video_devices(); // 现在只查找 USB 视频设备
+                 Button("刷新设备列表", [&] { // Capture logs_mutex, video_devices, serial_devices, serial_list_container, selected_video, selected_serial, screen, state_mutex
+                    write_debug_log("点击刷新设备列表按钮 (无设备时)");
+                    // Execute refresh operation in a new thread
+                    std::thread refresh_thread([&] { // Capture logs_mutex, video_devices, serial_devices, screen, state_mutex
+                         write_debug_log("刷新设备列表线程开始 (无设备时)");
+                        auto new_video_devices = find_video_devices(); // Now only finds USB video devices
                         auto new_serial_devices = find_serial_devices();
 
-                        // 锁定状态变量进行更新
-                        std::lock_guard<std::mutex> lock(state_mutex); // 确保在更新共享状态前锁定
+                        // Lock state variables for update
+                        std::lock_guard<std::mutex> lock(state_mutex); // Ensure locking before updating shared state
                         video_devices = new_video_devices;
                         serial_devices = new_serial_devices;
 
-                        // 重新填充 serial_list_container (通过事件通知主线程)
-                        write_debug_log("设备列表刷新完成，发送 UI 更新事件");
-                        screen.PostEvent(ftxui::Event::Custom); // 发送自定义事件通知 UI 更新
+                        // Repopulate serial_list_container (notify main thread via event)
+                        write_debug_log("设备列表刷新完成，发送 UI 更新事件 (无设备时)");
+                        screen.PostEvent(ftxui::Event::Custom); // Send custom event to notify UI update
                     });
-                    refresh_thread.detach(); // 分离线程，让其独立运行
+                    refresh_thread.detach(); // Detach thread to run independently
 
-                    // 锁定日志进行写入
+                    // Lock logs for writing
                     std::lock_guard<std::mutex> log_lock_button(logs_mutex);
                     logs.push_back("已触发设备列表刷新。");
 
@@ -722,7 +831,7 @@ int main() {
                             res_elements_horizontal.push_back(text("  " + format_name + ": ") | dim); // Format name
 
                             std::stringstream res_line;
-                            for(size_t j = 0; j < resolutions.size(); ++j) {
+                            for(size_t j = 0; j < resolutions.size(); ++j) { // Correct loop condition
                                 res_line << resolutions[j];
                                 if (j < resolutions.size() - 1) {
                                     res_line << " "; // Separate resolutions with a space
@@ -775,12 +884,34 @@ int main() {
          }
         // 锁定状态变量进行读取
         std::lock_guard<std::mutex> state_lock(state_mutex);
+
+        Elements ip_elements;
+        ip_elements.push_back(text("IP 地址: ") | dim);
+        if (sys_info.ip_addresses.empty()) {
+            ip_elements.push_back(text("获取失败或未连接"));
+        } else {
+            std::stringstream ip_line;
+            for(size_t i = 0; i < sys_info.ip_addresses.size(); ++i) {
+                ip_line << sys_info.ip_addresses[i];
+                if (i < sys_info.ip_addresses.size() - 1) {
+                    ip_line << ", ";
+                }
+            }
+            ip_elements.push_back(text(ip_line.str()));
+        }
+
+
         return vbox(Elements{
+            hbox(Elements{text("主机名: ") | dim, text(sys_info.hostname)}), // Display hostname
             hbox(Elements{text("系统: ") | dim, text(sys_info.os_version)}),
-            hbox(Elements{text("CPU: ") | dim, text(sys_info.cpu_info)}),
+            hbox(Elements{text("CPU: ") | dim, text(sys_info.cpu_info)}), // Display CPU model name
             hbox(Elements{text("内存: ") | dim, text(sys_info.memory)}),
             hbox(Elements{text("运行时间: ") | dim, text(sys_info.uptime)}),
-            hbox(Elements{text("网络: ") | dim, text(sys_info.network_info)})
+            hbox(Elements{text("网络: ") | dim, text(sys_info.network_info)}), // Display network info with SSID
+            hbox(Elements{text("CPU 温度 (平均): ") | dim, text(sys_info.cpu_temperature_avg)}), // Display average CPU temperature
+            // Removed CPU serial number display
+            // hbox(Elements{text("CPU 序列号: ") | dim, text(sys_info.cpu_serial)}) // Display CPU serial
+            hbox(ip_elements) // Display IP addresses
         });
     });
 
@@ -791,23 +922,23 @@ int main() {
         std::thread refresh_thread([&] { // 捕获 logs_mutex, sys_info, video_devices, serial_devices, screen, state_mutex
             write_debug_log("刷新所有信息线程开始");
 
-            // 锁定状态变量进行更新
-            std::lock_guard<std::mutex> lock(state_mutex); // 确保在更新共享状态前锁定
+            // Lock state variables for update
+            std::lock_guard<std::mutex> lock(state_mutex);
 
-            sys_info.refresh(); // 刷新系统信息并记录日志
-            auto new_video_devices = find_video_devices(); // 现在只查找 USB 视频设备
-            auto new_serial_devices = find_serial_devices(); // 刷新串口设备并记录日志
+            sys_info.refresh(); // Refresh system info and log
+            auto new_video_devices = find_video_devices(); // Find USB video devices and log
+            auto new_serial_devices = find_serial_devices(); // Find serial devices and log
 
             video_devices = new_video_devices;
             serial_devices = new_serial_devices;
 
-            // 重新填充 serial_list_container (通过事件通知主线程)
+            // Repopulate serial_list_container (notify main thread via event)
             write_debug_log("所有信息刷新完成，发送 UI 更新事件");
-            screen.PostEvent(ftxui::Event::Custom); // 发送自定义事件通知 UI 更新
+            screen.PostEvent(ftxui::Event::Custom); // Send custom event to notify UI update
         });
-        refresh_thread.detach(); // 分离线程，让其独立运行
+        refresh_thread.detach(); // Detach thread to run independently
 
-        // 锁定日志进行写入
+        // Lock logs for writing
         std::lock_guard<std::mutex> log_lock_button(logs_mutex);
         logs.push_back("已触发所有信息刷新。");
     });
@@ -817,8 +948,55 @@ int main() {
         Elements log_lines;
         {
             std::lock_guard<std::mutex> lock(logs_mutex);
+            // Filter logs to show only command execution related entries
             for (const auto& log : logs) {
-                log_lines.push_back(text(log));
+                // Updated filter criteria to be more inclusive of command execution details
+                if (log.rfind("执行命令:", 0) == 0 ||
+                    log.rfind("执行完整命令:", 0) == 0 ||
+                    log.rfind("设置管道为非阻塞模式", 0) == 0 ||
+                    log.rfind("读取到数据 (片段):", 0) == 0 ||
+                    log.rfind("读取完成 (EOF)", 0) == 0 ||
+                    log.rfind("管道错误或关闭", 0) == 0 ||
+                    log.rfind("命令退出状态码:", 0) == 0 ||
+                    log.rfind("命令未正常退出", 0) == 0 ||
+                    log.rfind("命令执行完成", 0) == 0 ||
+                    log.rfind("命令执行结果", 0) == 0 || // Includes success and error results
+                    log.rfind("命令超时", 0) == 0 ||
+                    log.rfind("命令读取失败", 0) == 0 ||
+                    log.rfind("poll 失败", 0) == 0 ||
+                    log.rfind("错误: popen()", 0) == 0 ||
+                    log.rfind("刷新系统信息...", 0) == 0 ||
+                    log.rfind("系统信息刷新完成。", 0) == 0 ||
+                    log.rfind("开始查找", 0) == 0 ||
+                    log.rfind("查找完成", 0) == 0 ||
+                    log.rfind("进入潜在 USB 设备组:", 0) == 0 ||
+                    log.rfind("找到 USB 视频设备路径:", 0) == 0 ||
+                    log.rfind("结束处理当前 USB 设备组", 0) == 0 ||
+                    log.rfind("找到", 0) == 0 && log.find("个 USB 视频设备路径") != std::string::npos ||
+                    log.rfind("查询 USB 设备分辨率和格式:", 0) == 0 ||
+                    log.rfind("v4l2-ctl --device", 0) == 0 && log.find("--list-formats-ext output:") != std::string::npos ||
+                    log.rfind("Debugging check_result for", 0) == 0 ||
+                    log.rfind("check_result length:", 0) == 0 ||
+                    log.rfind("check_result starts with:", 0) == 0 ||
+                    log.rfind("Regex search for", 0) == 0 ||
+                    log.rfind("Raw bytes", 0) == 0 ||
+                    log.rfind("检查结果:", 0) == 0 ||
+                    log.rfind("设备", 0) == 0 && (log.find("支持视频格式") != std::string::npos || log.find("不支持视频格式") != std::string::npos) ||
+                    log.rfind("切换到格式:", 0) == 0 ||
+                    log.rfind("为格式", 0) == 0 && log.find("找到分辨率:") != std::string::npos ||
+                    log.rfind("设备", 0) == 0 && log.find("找到的分辨率数量:") != std::string::npos ||
+                    log.rfind("添加设备", 0) == 0 && log.find("到列表") != std::string::npos ||
+                    log.rfind("设备", 0) == 0 && log.find("未提取到任何分辨率") != std::string::npos ||
+                    log.rfind("错误: 转换温度字符串失败:", 0) == 0 ||
+                    log.rfind("错误: 温度值超出范围:", 0) == 0 ||
+                    log.rfind("错误: 获取CPU温度失败", 0) == 0 ||
+                    log.rfind("错误: 获取CPU序列号失败", 0) == 0 || // Keep this filter for now, but the code won't generate this log anymore
+                    log.rfind("处理接口:", 0) == 0 || // Include network parsing logs
+                    log.rfind("找到 IPv4 地址:", 0) == 0
+                    )
+                 {
+                    log_lines.push_back(text(log));
+                 }
             }
         }
         return vbox(log_lines) | yframe | flex;
