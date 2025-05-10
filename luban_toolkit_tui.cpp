@@ -1,5 +1,5 @@
 #include <ftxui/component/component.hpp>
-#include <ftxui/component/screen_interactive.hpp>
+#include <ftxui/component/screen_interactive.hpp> // Corrected include path
 #include <ftxui/dom/elements.hpp>
 
 // 标准库头文件
@@ -157,8 +157,8 @@ std::string exec_command(const std::string& cmd, int timeout_ms = 5000, bool ign
                 // Data is available, read all of it in non-blocking mode
                 ssize_t n;
                 while ((n = read(fd, buffer.data(), buffer.size() - 1)) > 0) {
-                    buffer[n] = '\0';
-                    result += buffer.data();
+                    buffer[n] = '\0'; // Null-terminate the buffer
+                    result.append(buffer.data()); // Use append for string concatenation
                     // 避免日志过长，只记录读取到的数据片段
                     write_debug_log("读取到数据 (片段): " + std::string(buffer.data()).substr(0, std::min((size_t)50, (size_t)n)) + "...");
                 }
@@ -180,7 +180,7 @@ std::string exec_command(const std::string& cmd, int timeout_ms = 5000, bool ign
                  ssize_t n;
                  while ((n = read(fd, buffer.data(), buffer.size() - 1)) > 0) {
                      buffer[n] = '\0';
-                     result += buffer.data();
+                     result.append(buffer.data()); // Use append
                      write_debug_log("读取到剩余数据 (片段): " + std::string(buffer.data()).substr(0, std::min((size_t)50, (size_t)n)) + "...");
                  }
                  if (n < 0 && (errno != EAGAIN && errno != EWOULDBLOCK)) {
@@ -486,22 +486,26 @@ struct SystemInfo {
         std::string current_iface;
         std::istringstream ip_a_iss(ip_a_result);
         std::string ip_a_line;
-        std::regex ip_v4_regex("\\s*inet (\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})"); // Regex to capture IPv4 address
+
+        // Regex to capture interface name and state (e.g., "3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP>...")
+        std::regex iface_line_regex("^\\d+:\\s*([^:]+):.*state (UP|UNKNOWN)");
+        std::smatch iface_line_match;
+
+        // Regex to capture IPv4 address (e.g., "    inet 192.168.1.100/24 brd 192.168.1.255 scope global wlan0")
+        std::regex ip_v4_regex("\\s*inet (\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3})");
         std::smatch ip_v4_match;
-         std::regex iface_state_regex("^\\d+:\\s*([^:]+):.*state (UP|UNKNOWN)"); // Regex to capture interface name and state
+
 
         while(std::getline(ip_a_iss, ip_a_line)) {
-             std::smatch iface_state_match;
-             if (std::regex_search(ip_a_line, iface_state_match, iface_state_regex) && iface_state_match.size() > 2) {
-                 current_iface = iface_state_match[1].str();
-                 write_debug_log("处理接口: " + current_iface + " (状态: " + iface_state_match[2].str() + ")");
+             // Check if this line is an interface line
+             if (std::regex_search(ip_a_line, iface_line_match, iface_line_regex) && iface_line_match.size() > 1) {
+                 current_iface = iface_line_match[1].str(); // Capture interface name
+                 write_debug_log("处理接口行: " + ip_a_line + " -> 当前接口: " + current_iface);
              }
-             // Check for IPv4 addresses on active interfaces
-             if (!current_iface.empty() && (ip_a_line.find(" state UP") != std::string::npos || ip_a_line.find(" state UNKNOWN") != std::string::npos)) {
-                 if (std::regex_search(ip_a_line, ip_v4_match, ip_v4_regex) && ip_v4_match.size() > 1) {
-                     ip_addresses.push_back(current_iface + ": " + ip_v4_match[1].str());
-                     write_debug_log("找到 IPv4 地址: " + ip_v4_match[1].str() + " (接口: " + current_iface + ")");
-                 }
+             // Check if this line contains an IPv4 address and we have a current interface
+             else if (!current_iface.empty() && std::regex_search(ip_a_line, ip_v4_match, ip_v4_regex) && ip_v4_match.size() > 1) {
+                 ip_addresses.push_back(current_iface + ": " + ip_v4_match[1].str()); // Associate IP with current interface
+                 write_debug_log("为接口 " + current_iface + " 找到 IPv4 地址: " + ip_v4_match[1].str());
              }
         }
 
@@ -515,19 +519,56 @@ struct SystemInfo {
 
 
         std::stringstream network_info_ss;
-        network_info_ss << "接口: ";
         if (!ip_addresses.empty()) {
-             for(size_t i = 0; i < ip_addresses.size(); ++i) {
-                 network_info_ss << ip_addresses[i];
-                 if (i < ip_addresses.size() - 1) {
-                     network_info_ss << ", ";
-                 }
-             }
+            network_info_ss << "活跃接口: ";
+            for(size_t i = 0; i < ip_addresses.size(); ++i) {
+                network_info_ss << ip_addresses[i];
+                if (i < ip_addresses.size() - 1) {
+                    network_info_ss << ", ";
+                }
+            }
+            if (ssid != "获取失败") {
+                network_info_ss << " | WiFi: " << ssid;
+            }
         } else {
-             network_info_ss << "未找到活跃接口";
-        }
-        if (ssid != "获取失败") {
-             network_info_ss << " (SSID: " << ssid << ")";
+            // 尝试更详细地检测网络接口状态
+            std::string iface_check = exec_command("ip link show | grep 'state UP'", 1000, true);
+            if (iface_check.empty()) {
+                network_info_ss << "网络: 未连接";
+            } else {
+                // Check if any interface is UP but has no IP address
+                bool interface_up_no_ip = false;
+                std::istringstream iface_check_iss(iface_check);
+                std::string up_line;
+                while(std::getline(iface_check_iss, up_line)) {
+                    // Check if the UP interface is present in the ip_addresses list
+                    bool found_ip_for_up_iface = false;
+                    std::smatch up_iface_match;
+                    if (std::regex_search(up_line, up_iface_match, iface_line_regex) && up_iface_match.size() > 1) {
+                        std::string up_iface_name = up_iface_match[1].str();
+                        for (const auto& ip_entry : ip_addresses) {
+                            if (ip_entry.rfind(up_iface_name + ":", 0) == 0) {
+                                found_ip_for_up_iface = true;
+                                break;
+                            }
+                        }
+                        if (!found_ip_for_up_iface) {
+                            interface_up_no_ip = true;
+                            break; // Found an UP interface without an IP
+                        }
+                    }
+                }
+
+                if (interface_up_no_ip) {
+                     network_info_ss << "网络: 接口已启用但未获取IP";
+                } else {
+                     network_info_ss << "网络: 未获取到IP地址"; // Default if no UP interfaces or all UP interfaces have IPs (which shouldn't happen if ip_addresses is empty)
+                }
+            }
+
+            if (ssid != "获取失败") {
+                network_info_ss << " | WiFi: " << ssid;
+            }
         }
         network_info = network_info_ss.str();
 
@@ -688,6 +729,10 @@ int main() {
     bool serial_connected = false;
     std::unique_ptr<SerialPort> serial_port;
 
+    // 摄像头采集状态变量
+    std::atomic<bool> is_capturing(false);
+    std::string camera_status_message = "选择一个摄像头并点击 '获取图片'";
+
     // 在新线程中执行初始加载操作
     std::thread initial_load_thread([&] {
         write_debug_log("初始加载线程开始");
@@ -761,7 +806,7 @@ int main() {
     });
 
     // 摄像头组件 - 条件渲染
-    // 捕获 initial_load_complete, video_devices, serial_devices, serial_list_container, selected_video, selected_serial, logs_mutex, screen, state_mutex
+    // 捕获 initial_load_complete, video_devices, serial_devices, serial_list_container, selected_video, selected_serial, logs_mutex, screen, state_mutex, is_capturing, camera_status_message
     auto video_tab_content = Renderer([&] {
         // 锁定状态变量进行读取
         std::lock_guard<std::mutex> state_lock(state_mutex);
@@ -845,9 +890,80 @@ int main() {
                     })
                 }));
             }
-            // When devices are found, return a vbox (Elements) containing the rendered list container and the rendered button
+
+            // 获取图片按钮
+            // 捕获 video_devices, selected_video, is_capturing, camera_status_message, screen, logs_mutex, state_mutex
+            auto capture_button = Button(is_capturing ? "采集中..." : "获取图片", [&] {
+                // 锁定状态变量进行读取
+                std::lock_guard<std::mutex> state_lock(state_mutex);
+
+                if (is_capturing) {
+                    // 如果正在采集，忽略点击
+                    return;
+                }
+
+                if (video_devices.empty() || selected_video < 0 || static_cast<size_t>(selected_video) >= video_devices.size()) {
+                    // 没有选中设备或设备列表为空
+                    std::lock_guard<std::mutex> log_lock(logs_mutex);
+                    logs.push_back("错误: 没有选中的摄像头设备。");
+                    write_debug_log("错误: 没有选中的摄像头设备。");
+                    camera_status_message = "错误: 没有选中的摄像头设备。";
+                    return;
+                }
+
+                is_capturing = true;
+                camera_status_message = "正在采集图片...";
+                write_debug_log("开始图片采集过程...");
+                screen.PostEvent(ftxui::Event::Custom); // 更新 UI 显示“采集中...”
+
+                std::string device_path = video_devices[static_cast<size_t>(selected_video)].path;
+                std::string output_file = "/tmp/capture.jpg"; // 临时文件路径
+                // 使用 fswebcam 命令采集图片，尝试 640x480 分辨率
+                std::string capture_cmd = "fswebcam --device " + device_path + " --resolution 640x480 " + output_file + " 2>&1";
+
+                // 在新线程中执行采集命令
+                std::thread capture_thread([&, capture_cmd, output_file] { // 捕获 capture_cmd, output_file
+                    write_debug_log("采集线程开始执行命令: " + capture_cmd);
+                    std::string capture_result = exec_command(capture_cmd, 10000); // 10秒超时
+
+                    // 锁定状态变量进行更新
+                    std::lock_guard<std::mutex> state_lock_thread(state_mutex);
+                    std::lock_guard<std::mutex> log_lock_thread(logs_mutex);
+
+                    is_capturing = false; // 采集完成
+
+                    if (capture_result.rfind("错误:", 0) == 0) {
+                        // 命令执行失败
+                        camera_status_message = "采集失败: " + capture_result;
+                        logs.push_back("图片采集失败: " + capture_result);
+                        write_debug_log("图片采集失败: " + capture_result);
+                    } else {
+                        // 命令执行成功，检查文件是否存在
+                        std::ifstream file_check(output_file);
+                        if (file_check.good()) {
+                            camera_status_message = "图片采集成功: " + output_file;
+                            logs.push_back("图片采集成功: " + output_file);
+                            write_debug_log("图片采集成功: " + output_file);
+                        } else {
+                            camera_status_message = "采集完成但未找到输出文件: " + output_file;
+                            logs.push_back("图片采集完成但未找到输出文件: " + output_file);
+                            write_debug_log("图片采集完成但未找到输出文件: " + output_file);
+                        }
+                    }
+                    screen.PostEvent(ftxui::Event::Custom); // 更新 UI 显示结果
+                });
+                capture_thread.detach(); // 分离线程
+            });
+
+            // When devices are found, return a vbox (Elements) containing the rendered list container, capture button, status message and refresh button
             return vbox(Elements{
                 current_video_list->Render() | flex, // Render container to get Element
+                separator(),
+                hbox(Elements{
+                    capture_button->Render(), // 渲染获取图片按钮
+                    text(camera_status_message) | flex // 渲染状态信息
+                }),
+                separator(),
                  Button("刷新设备列表", [&] { // Capture logs_mutex, video_devices, serial_devices, serial_list_container, selected_video, selected_serial, screen, state_mutex
                     write_debug_log("点击刷新设备列表按钮 (有设备时)");
                     // Execute refresh operation in a new thread
@@ -904,7 +1020,6 @@ int main() {
         return vbox(Elements{
             hbox(Elements{text("主机名: ") | dim, text(sys_info.hostname)}), // Display hostname
             hbox(Elements{text("系统: ") | dim, text(sys_info.os_version)}),
-            hbox(Elements{text("CPU: ") | dim, text(sys_info.cpu_info)}), // Display CPU model name
             hbox(Elements{text("内存: ") | dim, text(sys_info.memory)}),
             hbox(Elements{text("运行时间: ") | dim, text(sys_info.uptime)}),
             hbox(Elements{text("网络: ") | dim, text(sys_info.network_info)}), // Display network info with SSID
@@ -951,48 +1066,88 @@ int main() {
             // Filter logs to show only command execution related entries
             for (const auto& log : logs) {
                 // Updated filter criteria to be more inclusive of command execution details
-                if (log.rfind("执行命令:", 0) == 0 ||
-                    log.rfind("执行完整命令:", 0) == 0 ||
-                    log.rfind("设置管道为非阻塞模式", 0) == 0 ||
-                    log.rfind("读取到数据 (片段):", 0) == 0 ||
-                    log.rfind("读取完成 (EOF)", 0) == 0 ||
-                    log.rfind("管道错误或关闭", 0) == 0 ||
-                    log.rfind("命令退出状态码:", 0) == 0 ||
-                    log.rfind("命令未正常退出", 0) == 0 ||
-                    log.rfind("命令执行完成", 0) == 0 ||
-                    log.rfind("命令执行结果", 0) == 0 || // Includes success and error results
-                    log.rfind("命令超时", 0) == 0 ||
-                    log.rfind("命令读取失败", 0) == 0 ||
-                    log.rfind("poll 失败", 0) == 0 ||
-                    log.rfind("错误: popen()", 0) == 0 ||
-                    log.rfind("刷新系统信息...", 0) == 0 ||
-                    log.rfind("系统信息刷新完成。", 0) == 0 ||
-                    log.rfind("开始查找", 0) == 0 ||
-                    log.rfind("查找完成", 0) == 0 ||
-                    log.rfind("进入潜在 USB 设备组:", 0) == 0 ||
-                    log.rfind("找到 USB 视频设备路径:", 0) == 0 ||
-                    log.rfind("结束处理当前 USB 设备组", 0) == 0 ||
-                    log.rfind("找到", 0) == 0 && log.find("个 USB 视频设备路径") != std::string::npos ||
-                    log.rfind("查询 USB 设备分辨率和格式:", 0) == 0 ||
-                    log.rfind("v4l2-ctl --device", 0) == 0 && log.find("--list-formats-ext output:") != std::string::npos ||
-                    log.rfind("Debugging check_result for", 0) == 0 ||
-                    log.rfind("check_result length:", 0) == 0 ||
-                    log.rfind("check_result starts with:", 0) == 0 ||
-                    log.rfind("Regex search for", 0) == 0 ||
-                    log.rfind("Raw bytes", 0) == 0 ||
-                    log.rfind("检查结果:", 0) == 0 ||
-                    log.rfind("设备", 0) == 0 && (log.find("支持视频格式") != std::string::npos || log.find("不支持视频格式") != std::string::npos) ||
-                    log.rfind("切换到格式:", 0) == 0 ||
-                    log.rfind("为格式", 0) == 0 && log.find("找到分辨率:") != std::string::npos ||
-                    log.rfind("设备", 0) == 0 && log.find("找到的分辨率数量:") != std::string::npos ||
-                    log.rfind("添加设备", 0) == 0 && log.find("到列表") != std::string::npos ||
-                    log.rfind("设备", 0) == 0 && log.find("未提取到任何分辨率") != std::string::npos ||
-                    log.rfind("错误: 转换温度字符串失败:", 0) == 0 ||
-                    log.rfind("错误: 温度值超出范围:", 0) == 0 ||
-                    log.rfind("错误: 获取CPU温度失败", 0) == 0 ||
-                    log.rfind("错误: 获取CPU序列号失败", 0) == 0 || // Keep this filter for now, but the code won't generate this log anymore
-                    log.rfind("处理接口:", 0) == 0 || // Include network parsing logs
-                    log.rfind("找到 IPv4 地址:", 0) == 0
+                if ((log.rfind("执行命令:", 0) == 0) ||
+                    (log.rfind("执行完整命令:", 0) == 0) ||
+                    (log.rfind("设置管道为非阻塞模式", 0) == 0) ||
+                    (log.rfind("读取到数据 (片段):", 0) == 0) ||
+                    (log.rfind("读取完成 (EOF)", 0) == 0) ||
+                    (log.rfind("管道错误或关闭", 0) == 0) ||
+                    (log.rfind("命令退出状态码:", 0) == 0) ||
+                    (log.rfind("命令未正常退出", 0) == 0) ||
+                    (log.rfind("命令执行完成", 0) == 0) ||
+                    (log.rfind("命令执行结果", 0) == 0) || // Includes success and error results
+                    (log.rfind("命令超时", 0) == 0) ||
+                    (log.rfind("命令读取失败", 0) == 0) ||
+                    (log.rfind("poll 失败", 0) == 0) ||
+                    (log.rfind("错误: popen()", 0) == 0) ||
+                    (log.rfind("刷新系统信息...", 0) == 0) ||
+                    (log.rfind("系统信息刷新完成。", 0) == 0) ||
+                    (log.rfind("开始查找", 0) == 0) ||
+                    (log.rfind("查找完成", 0) == 0) ||
+                    (log.rfind("进入潜在 USB 设备组:", 0) == 0) ||
+                    (log.rfind("找到 USB 视频设备路径:", 0) == 0) ||
+                    (log.rfind("结束处理当前 USB 设备组", 0) == 0) ||
+                    ((log.rfind("找到", 0) == 0) && (log.find("个 USB 视频设备路径") != std::string::npos)) ||
+                    (log.rfind("查询 USB 设备分辨率和格式:", 0) == 0) ||
+                    ((log.rfind("v4l2-ctl --device", 0) == 0) && (log.find("--list-formats-ext output:") != std::string::npos)) ||
+                    (log.rfind("Debugging check_result for", 0) == 0) ||
+                    (log.rfind("check_result length:", 0) == 0) ||
+                    (log.rfind("check_result starts with:", 0) == 0) ||
+                    (log.rfind("Regex search for", 0) == 0) ||
+                    (log.rfind("Raw bytes", 0) == 0) ||
+                    (log.rfind("检查结果:", 0) == 0) ||
+                    ((log.rfind("设备", 0) == 0) && ((log.find("支持视频格式") != std::string::npos) || (log.find("不支持视频格式") != std::string::npos))) ||
+                    (log.rfind("切换到格式:", 0) == 0) ||
+                    ((log.rfind("为格式", 0) == 0) && (log.find("找到分辨率:") != std::string::npos)) ||
+                    ((log.rfind("设备", 0) == 0) && (log.find("找到的分辨率数量:") != std::string::npos)) ||
+                    ((log.rfind("添加设备", 0) == 0) && (log.find("到列表") != std::string::npos)) ||
+                    ((log.rfind("设备", 0) == 0) && (log.find("未提取到任何分辨率") != std::string::npos)) ||
+                    (log.rfind("错误: 转换温度字符串失败:", 0) == 0) ||
+                    (log.rfind("错误: 温度值超出范围:", 0) == 0) ||
+                    (log.rfind("错误: 获取CPU温度失败", 0) == 0) ||
+                    (log.rfind("错误: 获取CPU序列号失败", 0) == 0) || // Keep this filter for now, but the code won't generate this log anymore
+                    (log.rfind("处理接口行:", 0) == 0) || // Include network parsing logs
+                    (log.rfind("当前接口:", 0) == 0) || // Include network parsing logs
+                    ((log.rfind("为接口", 0) == 0) && (log.find("找到 IPv4 地址:") != std::string::npos)) || // Include network parsing logs
+                    (log.rfind("未找到 /dev/ttyACM* 或 /dev/ttyUSB* 设备", 0) == 0) || // Include serial device logs
+                    (log.rfind("找到以下串口设备:", 0) == 0) || // Include serial device logs
+                    (log.rfind("找到串口设备:", 0) == 0) || // Include serial device logs
+                    (log.rfind("串口设备查找完成", 0) == 0) || // Include serial device logs
+                    (log.rfind("尝试打开串口:", 0) == 0) || // Include serial port logs
+                    (log.rfind("打开串口失败:", 0) == 0) || // Include serial port logs
+                    (log.rfind("获取串口属性失败:", 0) == 0) || // Include serial port logs
+                    (log.rfind("设置串口属性失败:", 0) == 0) || // Include serial port logs
+                    (log.rfind("串口打开成功:", 0) == 0) || // Include serial port logs
+                    (log.rfind("关闭串口。", 0) == 0) || // Include serial port logs
+                    (log.rfind("串口读取错误:", 0) == 0) || // Include serial port logs
+                    (log.rfind("点击连接/断开串口按钮...", 0) == 0) || // Include button click logs
+                    (log.rfind("串口已断开。", 0) == 0) || // Include serial connection logs
+                    (log.rfind("串口已连接:", 0) == 0) || // Include serial connection logs
+                    (log.rfind("连接串口失败:", 0) == 0) || // Include serial connection logs
+                    (log.rfind("错误: 选定的串口设备索引越界", 0) == 0) || // Include serial connection logs
+                    (log.rfind("错误: 没有可用的串口设备进行连接。", 0) == 0) || // Include serial connection logs
+                    (log.rfind("点击刷新设备列表按钮", 0) == 0) || // Include button click logs
+                    (log.rfind("刷新设备列表线程开始", 0) == 0) || // Include thread start logs
+                    (log.rfind("设备列表刷新完成", 0) == 0) || // Include refresh complete logs
+                    (log.rfind("已触发设备列表刷新。", 0) == 0) || // Include button click logs
+                    (log.rfind("选中视频设备:", 0) == 0) || // Include selection logs
+                    (log.rfind("点击刷新所有信息按钮", 0) == 0) || // Include button click logs
+                    (log.rfind("刷新所有信息线程开始", 0) == 0) || // Include thread start logs
+                    (log.rfind("所有信息刷新完成", 0) == 0) || // Include refresh complete logs
+                    (log.rfind("已触发所有信息刷新。", 0) == 0) || // Include button click logs
+                    (log.rfind("日志已清除。", 0) == 0) || // Include log clear logs
+                    (log.rfind("切换到标签页:", 0) == 0) || // Include tab switch logs
+                    (log.rfind("接收到终止信号", 0) == 0) || // Include signal logs
+                    (log.rfind("Tab 键按下", 0) == 0) || // Include event logs
+                    (log.rfind("按下 'q' 键", 0) == 0) || // Include event logs
+                    (log.rfind("接收到自定义事件", 0) == 0) || // Include event logs
+                    (log.rfind("选中串口设备:", 0) == 0) || // Include selection logs
+                    (log.rfind("点击获取图片按钮", 0) == 0) || // Include capture logs
+                    (log.rfind("开始图片采集过程...", 0) == 0) || // Include capture logs
+                    (log.rfind("采集线程开始执行命令:", 0) == 0) || // Include capture logs
+                    (log.rfind("图片采集失败:", 0) == 0) || // Include capture logs
+                    (log.rfind("图片采集成功:", 0) == 0) || // Include capture logs
+                    (log.rfind("采集完成但未找到输出文件:", 0) == 0) // Include capture logs
                     )
                  {
                     log_lines.push_back(text(log));
